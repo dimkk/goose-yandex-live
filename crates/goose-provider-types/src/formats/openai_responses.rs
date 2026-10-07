@@ -333,6 +333,30 @@ fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<Respon
     Ok(Some(event))
 }
 
+fn responses_stream_error(context: &str, error: Value) -> ProviderError {
+    let classifications = ["code", "type"]
+        .into_iter()
+        .filter_map(|key| error.get(key).and_then(Value::as_str));
+    let details = format!("{context}: {error:?}");
+
+    for classification in classifications {
+        match classification {
+            "server_is_overloaded" | "service_unavailable_error" | "server_error" => {
+                return ProviderError::ServerError(details);
+            }
+            "rate_limit_exceeded" | "slow_down" => {
+                return ProviderError::RateLimitExceeded {
+                    details,
+                    retry_delay: None,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    ProviderError::RequestFailed(details)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ResponseMetadata {
     pub id: String,
@@ -1261,17 +1285,17 @@ where
                 }
 
                 ResponsesStreamEvent::ResponseFailed { error, .. } => {
-                    Err::<(), ProviderError>(ProviderError::RequestFailed(format!(
-                        "Responses API failed: {:?}",
-                        error
-                    )))?;
+                    Err::<(), ProviderError>(responses_stream_error(
+                        "Responses API failed",
+                        error,
+                    ))?;
                 }
 
                 ResponsesStreamEvent::Error { error } => {
-                    Err::<(), ProviderError>(ProviderError::RequestFailed(format!(
-                        "Responses API error: {:?}",
-                        error
-                    )))?;
+                    Err::<(), ProviderError>(responses_stream_error(
+                        "Responses API error",
+                        error,
+                    ))?;
                 }
 
                 _ => {
@@ -1782,6 +1806,78 @@ mod tests {
             .contains("Responses API error"));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_classifies_overload_error_as_transient() {
+        let lines = vec![
+            r#"data: {"type":"error","error":{"message":"Our servers are currently overloaded. Please try again later.","type":"service_unavailable_error","param":null,"code":"unknown_gateway_code"}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let error = messages
+            .next()
+            .await
+            .expect("stream should emit an error item")
+            .expect_err("expected error")
+            .downcast::<ProviderError>()
+            .expect("expected a typed provider error");
+
+        assert!(matches!(error, ProviderError::ServerError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_classifies_response_failed_rate_limit() {
+        let lines = vec![
+            r#"data: {"type":"response.failed","sequence_number":1,"error":{"message":"slow down","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let error = messages
+            .next()
+            .await
+            .expect("stream should emit an error item")
+            .expect_err("expected error")
+            .downcast::<ProviderError>()
+            .expect("expected a typed provider error");
+
+        assert!(matches!(
+            error,
+            ProviderError::RateLimitExceeded {
+                retry_delay: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_responses_stream_keeps_unknown_error_as_request_failure() {
+        let lines = vec![
+            r#"data: {"type":"error","error":{"message":"bad input","type":"invalid_request_error","code":"invalid_value"}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let error = messages
+            .next()
+            .await
+            .expect("stream should emit an error item")
+            .expect_err("expected error")
+            .downcast::<ProviderError>()
+            .expect("expected a typed provider error");
+
+        assert!(matches!(error, ProviderError::RequestFailed(_)));
     }
 
     #[test]
